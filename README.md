@@ -1,2 +1,3 @@
 # rstore
-Redux for backend developers
+
+Redux for backend development
