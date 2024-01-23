@@ -335,8 +335,8 @@ class Store(Generic[S, A]):
             return self._state
 
     async def get_state(self) -> S:
-        async with self._lock:
-            if self._state is None:
-                raise InvalidStateError
+        if self._state is None:
+            raise InvalidStateError
 
+        async with self._lock:
             return self._state
