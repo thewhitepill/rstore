@@ -157,13 +157,14 @@ class Store(Generic[S, A]):
     _initial_state_factory: Callable[[], S]
     _state_type: Type[S]
     _action_type: Type[A]
+    _subscribers: set[Callable[[A, S], None]]
 
     _lock: Lock
 
     _redis_client: Optional[Redis]
     _redis_namespace: Optional[str]
     _redis_namespace_factory: Callable[[Store[S, A]], str]
-    _redis_channel_subscriber: Optional[Task]
+    _redis_pubsub_task: Optional[Task]
 
     def __init__(
         self,
@@ -178,14 +179,21 @@ class Store(Generic[S, A]):
         self._state = None
         self._state_type = reducer_generic_args[0]
         self._action_type = reducer_generic_args[1]
+        self._subscribers = set()
 
         self._initial_state_factory = initial_state_factory or self._state_type
 
         self._lock = Lock()
 
+        self._redis_client = None
+        self._redis_namespace = None
         self._redis_namespace_factory = redis_namespace_factory
 
-    async def _subscriber_loop(self, pubsub: PubSub) -> None:
+    def _notify(self, action: A, state: S) -> None:
+        for subscriber in self._subscribers:
+            subscriber(action, state)
+
+    async def _pubsub_handler(self, pubsub: PubSub) -> None:
         assert self._state is not None
 
         assert self._redis_client is not None
@@ -199,9 +207,8 @@ class Store(Generic[S, A]):
 
             data = message["data"]
 
-            action_container: _ActionContainer[A] = _ActionContainer[
-                self._action_type
-            ].model_validate_json(data)  # type: ignore[name-defined]
+            action_container: _ActionContainer[A] = \
+                _ActionContainer[self._action_type].model_validate_json(data) # type: ignore[name-defined]
 
             async with self._lock:
                 try:
@@ -209,10 +216,6 @@ class Store(Generic[S, A]):
 
                     if not is_fresh:
                         raise ConcurrencyError
-
-                    self._state = self._reducer(self._state, action_container.action)
-
-                    self._version = action_container.updated_version
                 except ConcurrencyError:
                     state_container: Optional[
                         _StateContainer[S]
@@ -224,6 +227,13 @@ class Store(Generic[S, A]):
 
                     self._version = state_container.version
                     self._state = state_container.state
+
+                    return
+
+                action = action_container.action
+                self._state = self._reducer(self._state, action)
+                self._version = action_container.updated_version
+                self._notify(action, self._state)
 
     async def bind(self, client: Redis) -> None:
         if self._state is not None:
@@ -261,25 +271,25 @@ class Store(Generic[S, A]):
                     ignore_subscribe_messages=True,
                 )
 
-                self._redis_channel_subscriber = asyncio.create_task(
-                    self._subscriber_loop(pubsub)
+                self._redis_pubsub_task = asyncio.create_task(
+                    self._pubsub_handler(pubsub)
                 )
 
     async def unbind(self) -> None:
         if self._state is None:
             raise InvalidStateError
 
-        assert self._redis_channel_subscriber is not None
+        assert self._redis_pubsub_task is not None
 
         async with self._lock:
-            self._redis_channel_subscriber.cancel()
+            self._redis_pubsub_task.cancel()
 
             self._version = None
             self._state = None
 
             self._redis_client = None
             self._redis_namespace = None
-            self._redis_channel_subscriber = None
+            self._redis_pubsub_task = None
 
     async def dispatch(self, action: A) -> S:
         if not self._state:
@@ -332,6 +342,8 @@ class Store(Generic[S, A]):
                 action_container.json(),
             )
 
+            self._notify(action, self._state)
+
             return self._state
 
     async def get_state(self) -> S:
@@ -340,3 +352,11 @@ class Store(Generic[S, A]):
 
         async with self._lock:
             return self._state
+
+    def subscribe(self, callback: Callable[[A, S], None]) -> Callable[[], None]:
+        self._subscribers.add(callback)
+
+        def unsubscribe() -> None:
+            self._subscribers.remove(callback)
+
+        return unsubscribe
