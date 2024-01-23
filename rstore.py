@@ -19,7 +19,8 @@ __all__ = (
     "Reducer",
     "Store",
     "StoreError",
-    "default_redis_namespace",
+    "Subscriber",
+    "default_redis_namespace"
 )
 
 
@@ -40,6 +41,7 @@ class ConcurrencyError(StoreError):
 
 
 Reducer = Callable[[S, A], S]
+Subscriber = Callable[[Optional[A], S], None]
 
 
 def _get_model_generic_args(model_type: type[BaseModel]) -> tuple[type, ...]:
@@ -157,7 +159,7 @@ class Store(Generic[S, A]):
     _initial_state_factory: Callable[[], S]
     _state_type: Type[S]
     _action_type: Type[A]
-    _subscribers: set[Callable[[A, S], None]]
+    _subscribers: set[Subscriber[A, S]]
 
     _lock: Lock
 
@@ -189,7 +191,7 @@ class Store(Generic[S, A]):
         self._redis_namespace = None
         self._redis_namespace_factory = redis_namespace_factory
 
-    def _notify(self, action: A, state: S) -> None:
+    def _notify(self, action: Optional[A], state: S) -> None:
         for subscriber in self._subscribers:
             subscriber(action, state)
 
@@ -275,6 +277,8 @@ class Store(Generic[S, A]):
                     self._pubsub_handler(pubsub)
                 )
 
+            self._notify(None, self._state)
+
     async def unbind(self) -> None:
         if self._state is None:
             raise InvalidStateError
@@ -353,10 +357,10 @@ class Store(Generic[S, A]):
         async with self._lock:
             return self._state
 
-    def subscribe(self, callback: Callable[[A, S], None]) -> Callable[[], None]:
-        self._subscribers.add(callback)
+    def subscribe(self, subscriber: Subscriber[A, S]) -> Callable[[], None]:
+        self._subscribers.add(subscriber)
 
         def unsubscribe() -> None:
-            self._subscribers.remove(callback)
+            self._subscribers.remove(subscriber)
 
         return unsubscribe
