@@ -108,7 +108,8 @@ async def _get_state_container(
         return None
 
     version, state = await client.mget(
-        _StateContainer.version_key(namespace), _StateContainer.state_key(namespace)
+        _StateContainer.version_key(namespace),
+        _StateContainer.state_key(namespace)
     )
 
     return _StateContainer[state_type](version=version, state=state)
@@ -213,17 +214,15 @@ class Store(Generic[S, A]):
                 _ActionContainer[self._action_type].model_validate_json(data) # type: ignore[name-defined]
 
             async with self._lock:
-                try:
-                    is_fresh = self._version == action_container.previous_version
+                is_fresh = self._version == action_container.previous_version
 
-                    if not is_fresh:
-                        raise ConcurrencyError
-                except ConcurrencyError:
-                    state_container: Optional[
-                        _StateContainer[S]
-                    ] = await _get_state_container(
-                        self._state_type, self._redis_client, self._redis_namespace
-                    )
+                if not is_fresh:
+                    state_container: Optional[_StateContainer[S]] = \
+                        await _get_state_container(
+                            self._state_type,
+                            self._redis_client,
+                            self._redis_namespace
+                        )
 
                     assert state_container is not None
 
@@ -245,16 +244,20 @@ class Store(Generic[S, A]):
             self._redis_client = client
             self._redis_namespace = self._redis_namespace_factory(self)
 
-            state_container: Optional[_StateContainer[S]] = await _get_state_container(
-                self._state_type, self._redis_client, self._redis_namespace
-            )
+            state_container: Optional[_StateContainer[S]] = \
+                await _get_state_container(
+                    self._state_type,
+                    self._redis_client,
+                    self._redis_namespace
+                )
 
             if state_container is None:
                 self._version = uuid4()
                 self._state = self._initial_state_factory()
 
                 state_container = _StateContainer(
-                    version=self._version, state=self._state
+                    version=self._version,
+                    state=self._state
                 )
 
                 await _set_state_container(
@@ -270,7 +273,7 @@ class Store(Generic[S, A]):
             async with self._redis_client.pubsub() as pubsub:
                 await pubsub.subscribe(
                     _ActionContainer.channel_name(self._redis_namespace),
-                    ignore_subscribe_messages=True,
+                    ignore_subscribe_messages=True
                 )
 
                 self._redis_pubsub_task = asyncio.create_task(
@@ -333,7 +336,7 @@ class Store(Generic[S, A]):
                 self._version = state_container.version
                 self._state = state_container.state
 
-                raise ConcurrencyError
+                raise
 
             action_container = _ActionContainer(
                 previous_version=previous_version,
