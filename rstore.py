@@ -5,7 +5,16 @@ import asyncio
 from asyncio import Lock, Task
 
 from inspect import signature
-from typing import Callable, Generic, Optional, Type, TypeAlias, TypeVar
+from typing import (
+    Awaitable,
+    Callable,
+    Generic,
+    Optional,
+    Type,
+    TypeAlias,
+    TypeVar
+)
+
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, field_validator, field_serializer
@@ -15,11 +24,18 @@ from redis.asyncio.client import PubSub
 
 __all__ = (
     "ConcurrencyError",
+    "Dispatch",
     "InvalidStateError",
+    "Middleware",
+    "RedisNamespaceFactory",
     "Reducer",
+    "StateFactory",
     "Store",
     "StoreError",
     "Subscriber",
+    "Unsubscribe",
+
+    "create_store",
     "default_redis_namespace"
 )
 
@@ -40,8 +56,64 @@ class ConcurrencyError(StoreError):
     pass
 
 
+Dispatch = Callable[[A], Awaitable[S]]
 Reducer = Callable[[S, A], S]
-Subscriber = Callable[[Optional[A], S], None]
+Subscriber = Callable[[Optional[A], Optional[S]], None]
+Unsubscribe = Callable[[], None]
+
+
+class Store(Generic[S, A]):
+    async def bind(self, client: Redis) -> None:
+        raise NotImplementedError
+
+    async def unbind(self) -> None:
+        raise NotImplementedError
+
+    async def dispatch(self, action: A) -> S:
+        raise NotImplementedError
+
+    async def get_state(self) -> S:
+        raise NotImplementedError
+
+    def subscribe(self, subscriber: Subscriber) -> Unsubscribe:
+        raise NotImplementedError
+
+
+Middleware = Callable[[Store[S, A], Dispatch, A], S]
+
+
+def _apply_middlware(
+    middleware: list[Middleware]
+) -> Callable[[Store[S, A]], Store[S, A]]:
+    def apply(original_store: Store[S, A]) -> Store[S, A]:
+        class EnhancedStore(Store[S, A]):
+            async def bind(self, client: Redis) -> None:
+                await original_store.bind(client)
+
+            async def unbind(self) -> None:
+                await original_store.unbind()
+
+            async def get_state(self) -> S:
+                return await original_store.get_state()
+
+            def subscribe(self, subscriber: Subscriber) -> Unsubscribe:
+                return original_store.subscribe(subscriber)
+
+        enhanced_store = EnhancedStore()
+        enhanced_dispatch = original_store.dispatch
+
+        for callable in reversed(middleware):
+            enhanced_dispatch = lambda action: callable( # noqa: E731
+                enhanced_store,
+                enhanced_dispatch,
+                action
+            )
+
+        setattr(enhanced_store, "dispatch", enhanced_dispatch)
+
+        return enhanced_store
+
+    return apply
 
 
 def _get_model_generic_args(model_type: type[BaseModel]) -> tuple[type, ...]:
@@ -150,49 +222,59 @@ async def _set_state_container(
 
 
 def default_redis_namespace(store: Store[S, A]) -> str:
-    return f"rstore:{store._state_type.__qualname__}"
+    return f"rstore:{store._state_type.__qualname__}" # type: ignore[attr-defined]
 
 
-class Store(Generic[S, A]):
-    _reducer: Reducer[S, A]
+StateFactory = Callable[[], S]
+RedisNamespaceFactory = Callable[[Store[S, A]], str]
+
+
+class _DefaultStore(Store[S, A]):
+    _reducer: Reducer
+    _initial_state_factory: StateFactory
+
     _version: Optional[UUID]
     _state: Optional[S]
-    _initial_state_factory: Callable[[], S]
-    _state_type: Type[S]
-    _action_type: Type[A]
-    _subscribers: set[Subscriber[A, S]]
+
+    _subscribers: set[Subscriber]
 
     _lock: Lock
 
     _redis_client: Optional[Redis]
     _redis_namespace: Optional[str]
-    _redis_namespace_factory: Callable[[Store[S, A]], str]
+    _redis_namespace_factory: RedisNamespaceFactory
     _redis_pubsub_task: Optional[Task]
+
+    _state_type: Type[S]
+    _action_type: Type[A]
 
     def __init__(
         self,
-        reducer: Reducer[S, A],
-        initial_state_factory: Optional[Callable[[], S]] = None,
-        redis_namespace_factory: Callable[[Store[S, A]], str] = default_redis_namespace,
+        reducer: Reducer,
+        initial_state_factory: StateFactory,
+        redis_namespace_factory: RedisNamespaceFactory,
+        state_type: Type[S],
+        action_type: Type[A]
     ) -> None:
-        reducer_generic_args = _get_reducer_generic_args(reducer)
-
         self._reducer = reducer
+        self._initial_state_factory = initial_state_factory
+
         self._version = None
         self._state = None
-        self._state_type = reducer_generic_args[0]
-        self._action_type = reducer_generic_args[1]
-        self._subscribers = set()
 
-        self._initial_state_factory = initial_state_factory or self._state_type
+        self._subscribers = set()
 
         self._lock = Lock()
 
         self._redis_client = None
         self._redis_namespace = None
         self._redis_namespace_factory = redis_namespace_factory
+        self._redis_pubsub_task = None
 
-    def _notify(self, action: Optional[A], state: S) -> None:
+        self._state_type = state_type
+        self._action_type = action_type
+
+    def _notify(self, action: Optional[A], state: Optional[S]) -> None:
         for subscriber in self._subscribers:
             subscriber(action, state)
 
@@ -298,6 +380,8 @@ class Store(Generic[S, A]):
             self._redis_namespace = None
             self._redis_pubsub_task = None
 
+        self._notify(None, None)
+
     async def dispatch(self, action: A) -> S:
         if not self._state:
             raise InvalidStateError
@@ -351,6 +435,8 @@ class Store(Generic[S, A]):
 
             self._notify(action, self._state)
 
+            assert self._state is not None
+
             return self._state
 
     async def get_state(self) -> S:
@@ -367,3 +453,24 @@ class Store(Generic[S, A]):
             self._subscribers.remove(subscriber)
 
         return unsubscribe
+
+
+def create_store(
+    reducer: Reducer,
+    initial_state_factory: Optional[StateFactory] = None,
+    redis_namespace_factory: RedisNamespaceFactory = default_redis_namespace,
+    middleware: list[Middleware] = []
+) -> Store[S, A]:
+    state_type, action_type = _get_reducer_generic_args(reducer)
+    store = _DefaultStore(
+        reducer,
+        initial_state_factory or state_type,
+        redis_namespace_factory,
+        state_type,
+        action_type
+    )
+
+    if not middleware:
+        return store
+
+    return _apply_middlware(middleware)(store)
