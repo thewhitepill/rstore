@@ -230,11 +230,11 @@ async def _set_state_container(
             if current_remote_version != current_local_version:
                 raise ConcurrencyError
 
-        await pipe.multi()
+        pipe.multi()
 
         data = container.model_dump()
 
-        await pipe.mset(
+        pipe.mset(
             {
                 _StateContainer.version_key(namespace): data["version"],
                 _StateContainer.state_key(namespace): data["state"]
