@@ -13,7 +13,8 @@ from typing import (
     Optional,
     Type,
     TypeAlias,
-    TypeVar
+    TypeVar,
+    Union
 )
 
 from uuid import UUID, uuid4
@@ -168,14 +169,22 @@ class _StateContainer(BaseModel, Generic[S]):
 
     @field_validator("version", mode="before")
     @classmethod
-    def validate_version(cls, value: str) -> UUID:
+    def validate_version(cls, value: Union[UUID, str]) -> UUID:
+        if isinstance(value, UUID):
+            return value
+
         return UUID(value)
 
     @field_validator("state", mode="before")
     @classmethod
-    def validate_state(cls, value: str) -> S:
+    def validate_state(cls, value: Union[S, str]) -> S:
         state_model: type[S]
         state_model = _get_model_generic_args(cls)[0]
+
+        if isinstance(value, state_model):
+            return value
+
+        assert isinstance(value, str)
 
         return state_model.model_validate_json(value)
 
