@@ -345,6 +345,8 @@ class _DefaultStore(Store[S, A]):
         if self._state is not None:
             raise InvalidStateError
 
+        state_type = self.state_type
+
         async with self._lock:
             self._redis_client = client
             self._redis_namespace = self._redis_namespace_factory(self)
@@ -360,7 +362,7 @@ class _DefaultStore(Store[S, A]):
                 self._version = uuid4()
                 self._state = self._initial_state_factory()
 
-                state_container = _StateContainer(
+                state_container = _StateContainer[state_type]( # type: ignore[valid-type]
                     version=self._version,
                     state=self._state
                 )
