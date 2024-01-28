@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 from asyncio import Lock, Task
 
@@ -63,6 +64,9 @@ Unsubscribe = Callable[[], None]
 
 
 class Store(Generic[S, A]):
+    state_type: type[S]
+    action_type: type[A]
+
     async def bind(self, client: Redis) -> None:
         raise NotImplementedError
 
@@ -87,6 +91,10 @@ def _apply_middlware(
 ) -> Callable[[Store[S, A]], Store[S, A]]:
     def apply(original_store: Store[S, A]) -> Store[S, A]:
         class EnhancedStore(Store[S, A]):
+            def __init__(self) -> None:
+                self.state_type = original_store.state_type
+                self.action_type = original_store.action_type
+
             async def bind(self, client: Redis) -> None:
                 await original_store.bind(client)
 
@@ -99,7 +107,9 @@ def _apply_middlware(
             def subscribe(self, subscriber: Subscriber) -> Unsubscribe:
                 return original_store.subscribe(subscriber)
 
-        enhanced_store = EnhancedStore()
+        enhanced_store = \
+            EnhancedStore[original_store.state_type, original_store.action_type]() # type: ignore[misc]
+
         enhanced_dispatch = original_store.dispatch
 
         for callable in reversed(middleware):
@@ -117,13 +127,17 @@ def _apply_middlware(
 
 
 def _get_model_generic_args(model_type: type[BaseModel]) -> tuple[type, ...]:
-    return model_type.__pydantic_model__.get["args"]  # type: ignore[attr-defined]
+    return model_type.__pydantic_generic_metadata__["args"]
 
 
-def _get_reducer_generic_args(reducer: Reducer[S, A]) -> tuple[Type[S], Type[A]]:
+def _get_reducer_generic_args(reducer: Reducer) -> tuple[Type[S], Type[A]]:
     state_type, action_type = map(
-        lambda p: p.annotation, signature(reducer).parameters.values()
+        lambda p: p.annotation,
+        signature(reducer).parameters.values()
     )
+
+    if inspect._empty in (state_type, action_type):
+        raise TypeError("Reducer must have type annotations")
 
     return state_type, action_type
 
@@ -160,7 +174,8 @@ class _StateContainer(BaseModel, Generic[S]):
     @field_validator("state", mode="before")
     @classmethod
     def validate_state(cls, value: str) -> S:
-        state_model: type[S] = _get_model_generic_args(cls)[0]
+        state_model: type[S]
+        state_model = _get_model_generic_args(cls)[0]
 
         return state_model.model_validate_json(value)
 
@@ -174,7 +189,9 @@ class _StateContainer(BaseModel, Generic[S]):
 
 
 async def _get_state_container(
-    state_type: TypeAlias, client: Redis, namespace: str
+    state_type: TypeAlias,
+    client: Redis,
+    namespace: str
 ) -> Optional[_StateContainer[S]]:
     if not await client.exists(_StateContainer.version_key(namespace)):
         return None
@@ -191,7 +208,7 @@ async def _set_state_container(
     container: _StateContainer[S],
     current_local_version: Optional[UUID],
     client: Redis,
-    namespace: str,
+    namespace: str
 ) -> None:
     async with client.pipeline(transaction=True) as pipe:
         await pipe.watch(_StateContainer.version_key(namespace))
@@ -222,7 +239,7 @@ async def _set_state_container(
 
 
 def default_redis_namespace(store: Store[S, A]) -> str:
-    return f"rstore:{store._state_type.__qualname__}" # type: ignore[attr-defined]
+    return f"rstore:{store.state_type.__qualname__}"
 
 
 StateFactory = Callable[[], S]
@@ -245,17 +262,17 @@ class _DefaultStore(Store[S, A]):
     _redis_namespace_factory: RedisNamespaceFactory
     _redis_pubsub_task: Optional[Task]
 
-    _state_type: Type[S]
-    _action_type: Type[A]
-
     def __init__(
         self,
+        state_type: Type[S],
+        action_type: Type[A],
         reducer: Reducer,
         initial_state_factory: StateFactory,
-        redis_namespace_factory: RedisNamespaceFactory,
-        state_type: Type[S],
-        action_type: Type[A]
+        redis_namespace_factory: RedisNamespaceFactory
     ) -> None:
+        self.state_type = state_type
+        self.action_type = action_type
+
         self._reducer = reducer
         self._initial_state_factory = initial_state_factory
 
@@ -270,9 +287,6 @@ class _DefaultStore(Store[S, A]):
         self._redis_namespace = None
         self._redis_namespace_factory = redis_namespace_factory
         self._redis_pubsub_task = None
-
-        self._state_type = state_type
-        self._action_type = action_type
 
     def _notify(self, action: Optional[A], state: Optional[S]) -> None:
         for subscriber in self._subscribers:
@@ -291,9 +305,9 @@ class _DefaultStore(Store[S, A]):
                 continue
 
             data = message["data"]
-
+            action_type = self.action_type
             action_container: _ActionContainer[A] = \
-                _ActionContainer[self._action_type].model_validate_json(data) # type: ignore[name-defined]
+                _ActionContainer[action_type].model_validate_json(data) # type: ignore[valid-type]
 
             async with self._lock:
                 is_fresh = self._version == action_container.previous_version
@@ -301,7 +315,7 @@ class _DefaultStore(Store[S, A]):
                 if not is_fresh:
                     state_container: Optional[_StateContainer[S]] = \
                         await _get_state_container(
-                            self._state_type,
+                            self.state_type,
                             self._redis_client,
                             self._redis_namespace
                         )
@@ -328,7 +342,7 @@ class _DefaultStore(Store[S, A]):
 
             state_container: Optional[_StateContainer[S]] = \
                 await _get_state_container(
-                    self._state_type,
+                    self.state_type,
                     self._redis_client,
                     self._redis_namespace
                 )
@@ -391,6 +405,8 @@ class _DefaultStore(Store[S, A]):
         assert self._redis_client is not None
         assert self._redis_namespace is not None
 
+        state_type = self.state_type
+        action_type = self.action_type
         state_container: Optional[_StateContainer[S]]
 
         async with self._lock:
@@ -398,9 +414,9 @@ class _DefaultStore(Store[S, A]):
 
             self._state = self._reducer(self._state, action)
             self._version = uuid4()
-
-            state_container = _StateContainer[self._state_type](  # type: ignore[name-defined]
-                version=self._version, state=self._state
+            state_container = _StateContainer[state_type]( # type: ignore[valid-type]
+                version=self._version,
+                state=self._state
             )
 
             try:
@@ -408,11 +424,13 @@ class _DefaultStore(Store[S, A]):
                     state_container,
                     previous_version,
                     self._redis_client,
-                    self._redis_namespace,
+                    self._redis_namespace
                 )
             except ConcurrencyError:
                 state_container = await _get_state_container(
-                    self._state_type, self._redis_client, self._redis_namespace
+                    state_type,
+                    self._redis_client,
+                    self._redis_namespace
                 )
 
                 assert state_container is not None
@@ -422,15 +440,15 @@ class _DefaultStore(Store[S, A]):
 
                 raise
 
-            action_container = _ActionContainer(
+            action_container = _ActionContainer[action_type]( # type: ignore[valid-type]
                 previous_version=previous_version,
                 updated_version=self._version,
-                action=action,
+                action=action
             )
 
             await self._redis_client.publish(
                 _ActionContainer.channel_name(self._redis_namespace),
-                action_container.json(),
+                action_container.json()
             )
 
             self._notify(action, self._state)
@@ -461,13 +479,17 @@ def create_store(
     redis_namespace_factory: RedisNamespaceFactory = default_redis_namespace,
     middleware: list[Middleware] = []
 ) -> Store[S, A]:
+    state_type: type[S]
+    action_type: type[A]
+
     state_type, action_type = _get_reducer_generic_args(reducer)
-    store = _DefaultStore(
+
+    store = _DefaultStore[state_type, action_type]( # type: ignore[valid-type]
+        state_type,
+        action_type,
         reducer,
         initial_state_factory or state_type,
-        redis_namespace_factory,
-        state_type,
-        action_type
+        redis_namespace_factory
     )
 
     if not middleware:
