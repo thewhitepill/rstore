@@ -114,11 +114,14 @@ def _apply_middlware(
         enhanced_dispatch = original_store.dispatch
 
         for callable in reversed(middleware):
-            enhanced_dispatch = lambda action: callable( # noqa: E731
+            current_enhanced_dispatch = enhanced_dispatch
+            updated_enhanced_dispatch = lambda action: callable( # noqa: E731
                 enhanced_store,
-                enhanced_dispatch,
+                current_enhanced_dispatch,
                 action
             )
+
+            enhanced_dispatch = updated_enhanced_dispatch
 
         setattr(enhanced_store, "dispatch", enhanced_dispatch)
 
